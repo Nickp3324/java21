@@ -1,0 +1,175 @@
+name: CI/CD Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - uat
+ 
+env:
+  ARTIFACTORY_URL_DEV: "enterpriseprotal-docker-dev.artifactory.dhl.com"
+  ARTIFACTORY_REPO_DEV: "enterpriseprotal-docker-dev"
+  JAVA_VERSION: "21"
+  MVN_VERSION: "3.8.5"
+  ARTIFACTORY_URL_RELEASE: "https://artifactory.dhl.com/artifactory/enterpriseportal-maven-release"
+  ARTIFACTORY_URL_SNAPSHOTS: "https://artifactory.dhl.com/artifactory/enterpriseportal-maven-dev" 
+  SERVICE_NAME: "filemonitor-service"
+  docker_username: srv_enterpriseportal
+  IMAGE_TAG: ${{ github.ref_name }}-${{ github.run_number }}
+  # UAT
+  ARTIFACTORY_URL_UAT: "enterpriseprotal-docker-uat.artifactory.dhl.com"
+  ARTIFACTORY_REPO_UAT: "enterpriseprotal-docker-uat"
+
+jobs:
+  build:
+    runs-on: arc-medium-container
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with: 
+         path: . 
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Set up Maven
+        uses: stCarolas/setup-maven@v5
+        with:
+          maven-version: ${{ env.MVN_VERSION }}
+
+      - name: Inject Credentials into settings.xml
+        run: |
+          sed -i 's#<username>.*</username>#<username>${{ secrets.ARTIFACTORY_USERNAME }}</username>#g' ./settings.xml
+          sed -i 's#<password>.*</password>#<password>${{ secrets.ARTIFACTORY_PASSWORD }}</password>#g' ./settings.xml
+
+      - name: Validate Environment Variables
+        run: |
+          echo "Release URL: ${{ env.ARTIFACTORY_URL_RELEASE }}"
+          echo "Snapshot URL: ${{ env.ARTIFACTORY_URL_SNAPSHOTS }}"
+
+      - name: Copy Maven settings
+        run: |
+          mkdir -p ~/.m2
+          cp ./settings.xml ~/.m2/settings.xml
+
+      - name: Build Artifact
+        run: |
+          mvn clean package -B -DskipTests \
+            --settings ~/.m2/settings.xml \
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: built-jar
+          path: target/EntPortal-filemonitor-service-1.0.jar
+
+  docker:
+    needs: build
+    runs-on: arc-medium-container
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+            path: .
+
+      - name: Download JAR
+        uses: actions/download-artifact@v3
+        with:
+          name: built-jar
+          path: target
+
+      - name: Docker Login
+        run: |
+          echo -n "2302131626@Bdel" | docker login enterpriseprotal-docker-dev.artifactory.dhl.com -u "ragohil" --password-stdin
+
+      - name: Set up Docker BuildX
+        uses: docker/setup-buildx-action@v2
+        with:
+          driver-opts: image=enterpriseprotal-docker-dev.artifactory.dhl.com/moby/buildkit:master
+          buildkitd-flags: --debug
+          config-inline: |
+            [registry."docker.io"]
+              mirrors = ["enterpriseprotal-docker-dev.artifactory.dhl.com"]  
+
+      - name: Build and Push Docker Image
+        if: always()
+        env:
+          IMAGE_TAG: ${{ github.ref_name }}-${{ github.run_number }}
+        run: |
+          IMAGE_REPO=${{ env['ARTIFACTORY_REPO_' + github.event.inputs.environment | upper ] }}
+          IMAGE_URL=${{ env['ARTIFACTORY_URL_' + github.event.inputs.environment | upper ] }}
+          docker build -t $IMAGE_URL/$IMAGE_REPO/entportal-${{ env.SERVICE_NAME }}:${{ env.IMAGE_TAG }} .
+          docker push $IMAGE_URL/$IMAGE_REPO/entportal-${{ env.SERVICE_NAME }}:${{ env.IMAGE_TAG }}
+
+      - name: Verify Image Push
+        run: |
+          echo "Listing Docker Images"
+          docker images | grep entportal-${{ env.SERVICE_NAME }} 
+
+  deploy:
+    needs: docker
+    runs-on: arc-medium-container
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+            path: .
+
+      - name: Download OpenShift CLI from an Alternative Source
+        run: |
+          curl -O -J -L -u "${{ secrets.ARTIFACTORY_USERNAME }}:${{ secrets.ARTIFACTORY_PASSWORD }}" \
+          "https://artifactory.dhl.com/artifactory/enterpriseprotal-docker-dev/openshift/origin-cli/latest/oc.tar.gz"
+          tar -xvzf oc.tar.gz
+          mkdir -p $HOME/.local/bin
+          mv oc $HOME/.local/bin/
+
+      - name: Install OpenShift CLI from Artifactory
+        run: |
+          curl -u "${{ secrets.ARTIFACTORY_USERNAME }}:${{ secrets.ARTIFACTORY_PASSWORD }}" \
+          -O "https://artifactory.dhl.com/artifactory/enterpriseprotal-docker-dev/openshift/origin-cli/latest/oc.tar.gz"
+
+      - name: Extract OpenShift CLI
+        run: |
+          ls -lah oc.tar.gz  # Check file size and existence
+          head -c 4 oc.tar.gz | od -A n -t x1
+          head -n 20 oc.tar.gz
+          tar -xvzf oc.tar.gz
+          chmod +x oc
+          mkdir -p $HOME/.local/bin
+          mv oc $HOME/.local/bin/
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Authenticate and set context
+        uses: redhat-actions/oc-login@v1
+        with:
+          openshift_server_url: https://api.mykulocp001.dhl.com:6443
+          openshift_username: ${{ secrets.ARTIFACTORY_USERNAME }}
+          openshift_password: ${{ secrets.ARTIFACTORY_PASSWORD }}
+        # oc login --username=${{ secrets.OCP_USERNAME }} --password=${{ secrets.OCP_PASSWORD }} --server=https://api.mykulocp001.dhl.com:6443
+
+      - name: Prepare Deployment YAML
+        run: |
+          cp Deployment-${{ github.event.inputs.environment }}.yml temp-deployment.yml
+          sed -i "s|\${service_name}|${{ env.SERVICE_NAME }}|g" temp-deployment.yml
+          sed -i "s|\${ARTIFACTORY_URL}|${{ env['ARTIFACTORY_URL_' + github.event.inputs.environment | upper ] }}|g" temp-deployment.yml
+          sed -i "s|\${ARTIFACTORY_REPO}|${{ env['ARTIFACTORY_REPO_' + github.event.inputs.environment | upper ] }}|g" temp-deployment.yml
+          sed -i "s|\${image_tag}|${{ env.IMAGE_TAG }}|g" temp-deployment.yml
+
+      - name: Apply Deployment
+        run: |
+          oc project ecs-enterprise-portal-${{ github.event.inputs.environment }}
+          oc create configmap ${{ env.SERVICE_NAME }}-config --from-file=${{ github.event.inputs.environment }}/application.properties --dry-run=client -o yaml | oc apply -f -
+          oc apply -f temp-deployment.yml
+          oc rollout status deployment/entportal-${{ env.SERVICE_NAME }}
+          echo "Deployment Successful in ${{ github.event.inputs.environment }}"
